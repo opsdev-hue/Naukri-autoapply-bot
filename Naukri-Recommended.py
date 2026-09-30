@@ -247,6 +247,36 @@ def _login_error_text(driver):
         return False
 
 
+
+def _generic_login_error_with_otp_option(driver):
+    """Detect Naukri's generic login error page that offers OTP as an alternative."""
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text.lower()
+        return "something went wrong" in body and "use otp to login" in body
+    except Exception:
+        return False
+
+
+def _start_otp_login(driver):
+    """Switch to Naukri's normal OTP login flow; OTP itself is always entered manually."""
+    selectors = [
+        (By.XPATH, "//*[self::button or self::a or @role='button'][contains(normalize-space(.),'Use OTP to Login')]"),
+        (By.XPATH, "//*[contains(normalize-space(.),'Use OTP to Login')]"),
+    ]
+
+    for by, selector in selectors:
+        try:
+            elements = driver.find_elements(by, selector)
+            for element in elements:
+                if element.is_displayed() and element.is_enabled():
+                    driver.execute_script("arguments[0].click();", element)
+                    logger.info("🔑 Switched to Naukri OTP login.")
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def _manual_verification_required(driver):
     """Detect OTP/CAPTCHA/security checks; do not attempt to bypass them."""
     try:
@@ -303,7 +333,18 @@ def _wait_for_login_completion(driver):
     if timeout == 0:
         logger.info("LOGIN_WAIT_TIMEOUT=0: waiting indefinitely.")
 
+    otp_started = False
+
     while timeout == 0 or (time.monotonic() - start) < timeout:
+        # Naukri may show a generic error with "Use OTP to Login".
+        # Switch to that normal OTP flow, then wait for the user to enter OTP manually.
+        if not otp_started and _generic_login_error_with_otp_option(driver):
+            if _start_otp_login(driver):
+                otp_started = True
+                challenge_reported = False
+                time.sleep(2)
+                continue
+
         # Check verification first so a security/OTP page is never mistaken for a completed login.
         if _manual_verification_required(driver):
             if not challenge_reported:
@@ -316,6 +357,13 @@ def _wait_for_login_completion(driver):
             return True
 
         if _login_error_text(driver):
+            # A generic error may still offer the OTP path; do not immediately abort.
+            if _generic_login_error_with_otp_option(driver):
+                if _start_otp_login(driver):
+                    otp_started = True
+                    challenge_reported = False
+                    time.sleep(2)
+                    continue
             logger.error("Naukri reported invalid/failed login credentials.")
             return False
 
