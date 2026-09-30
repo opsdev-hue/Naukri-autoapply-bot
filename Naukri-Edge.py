@@ -59,6 +59,10 @@ PAGES_PER_KEYWORD = int(os.getenv('PAGES_PER_KEYWORD', '2'))
 # --- Edge Driver Path (optional, only if NOT using webdriver-manager) ---
 EDGE_DRIVER_PATH = os.getenv('EDGE_DRIVER_PATH', '')
 
+LOGIN_WAIT_TIMEOUT = int(os.getenv('LOGIN_WAIT_TIMEOUT', '0'))  # 0 = wait indefinitely
+LOGIN_FORM_WAIT = int(os.getenv('LOGIN_FORM_WAIT', '20'))
+LOGIN_POLL_SECONDS = 2
+
 # ------------------------------------------------------------
 # Logging Setup
 # ------------------------------------------------------------
@@ -113,28 +117,199 @@ def create_edge_driver():
     return driver
 
 
+def _find_visible(driver, selectors):
+    """Return the first visible/enabled element matching any selector."""
+    for by, selector in selectors:
+        try:
+            for element in driver.find_elements(by, selector):
+                if element.is_displayed() and element.is_enabled():
+                    return element
+        except Exception:
+            continue
+    return None
+
+
+def _login_username_selectors():
+    return [
+        (By.ID, "usernameField"),
+        (By.NAME, "usernameField"),
+        (By.NAME, "USERNAME"),
+        (By.ID, "emailTxt"),
+        (By.CSS_SELECTOR, "input[placeholder*='Email ID']"),
+        (By.CSS_SELECTOR, "input[type='email']")
+    ]
+
+
+def _login_password_selectors():
+    return [
+        (By.ID, "passwordField"),
+        (By.NAME, "PASSWORD"),
+        (By.ID, "pwd1"),
+        (By.CSS_SELECTOR, "input[type='password']")
+    ]
+
+
+def _login_completed(driver):
+    """Detect successful authentication instead of assuming a fixed sleep."""
+    try:
+        url = driver.current_url.lower()
+        still_login_url = (
+            "login.naukri.com" in url
+            or "/nlogin/login" in url
+            or "/nlogin/" in url
+        )
+        username = _find_visible(driver, _login_username_selectors())
+        password = _find_visible(driver, _login_password_selectors())
+
+        if not still_login_url and not username and not password:
+            return True
+        if "/mnjuser/" in url and not username and not password:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _login_error_text(driver):
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text.lower()
+        phrases = (
+            "invalid password", "incorrect password", "invalid email",
+            "invalid username", "invalid credentials", "unable to login",
+            "login failed", "enter valid email", "enter valid password",
+        )
+        return any(p in body for p in phrases)
+    except Exception:
+        return False
+
+
+def _manual_verification_required(driver):
+    """Detect OTP/CAPTCHA/security checks; do not attempt to bypass them."""
+    try:
+        otp_selectors = [
+            (By.XPATH, "//input[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'otp')]"),
+            (By.XPATH, "//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'otp')]"),
+            (By.XPATH, "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'otp')]"),
+        ]
+        if _find_visible(driver, otp_selectors):
+            return True
+
+        body = driver.find_element(By.TAG_NAME, "body").text.lower()
+        phrases = (
+            "enter otp", "otp verification", "one time password",
+            "verification code", "verify your identity", "captcha",
+            "security check", "verify you are human", "robot",
+        )
+        return any(p in body for p in phrases)
+    except Exception:
+        return False
+
+
+def _click_login_submit(driver, password_element):
+    try:
+        form = password_element.find_element(By.XPATH, "./ancestor::form[1]")
+        buttons = form.find_elements(
+            By.CSS_SELECTOR,
+            "button[type='submit'], input[type='submit'], button"
+        )
+        for button in buttons:
+            try:
+                if button.is_displayed() and button.is_enabled():
+                    driver.execute_script("arguments[0].click();", button)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        password_element.send_keys(Keys.ENTER)
+        return True
+    except Exception:
+        return False
+
+
+def _wait_for_login_completion(driver):
+    """Wait until authenticated; user completes OTP/CAPTCHA in the visible browser."""
+    start = time.monotonic()
+    timeout = LOGIN_WAIT_TIMEOUT
+    challenge_reported = False
+
+    logger.info("Waiting for Naukri authentication to finish...")
+    if timeout == 0:
+        logger.info("LOGIN_WAIT_TIMEOUT=0: waiting indefinitely.")
+
+    while timeout == 0 or (time.monotonic() - start) < timeout:
+        if _login_completed(driver):
+            logger.info("✓ Naukri login verified.")
+            return True
+
+        if _login_error_text(driver):
+            logger.error("Naukri reported invalid/failed login credentials.")
+            return False
+
+        if _manual_verification_required(driver) and not challenge_reported:
+            logger.info("🔐 OTP/CAPTCHA/security verification detected.")
+            logger.info("👉 Complete it manually in the open browser window.")
+            logger.info("⏳ The bot will continue automatically after successful login.")
+            challenge_reported = True
+
+        time.sleep(LOGIN_POLL_SECONDS)
+
+    logger.error(f"Login wait timed out after {timeout} seconds.")
+    return False
+
+
 def login_naukri(driver):
-    """Log in to Naukri.com."""
+    """Robust Naukri login with manual OTP/CAPTCHA waiting."""
     logger.info("Logging in to Naukri.com...")
-    driver.get('https://login.naukri.com/')
-    time.sleep(3)
 
-    # Wait for username field
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.ID, 'usernameField'))
-    )
+    login_urls = [
+        "https://www.naukri.com/nlogin/login",
+        "https://login.naukri.com/nLogin/Login.php",
+    ]
 
-    uname = driver.find_element(By.ID, 'usernameField')
-    uname.send_keys(NAUKRI_EMAIL)
+    for login_url in login_urls:
+        try:
+            driver.get(login_url)
+        except WebDriverException as exc:
+            logger.warning(f"Could not open {login_url}: {exc}")
+            continue
 
-    passwd = driver.find_element(By.ID, 'passwordField')
-    passwd.send_keys(NAUKRI_PASSWORD)
-    passwd.send_keys(Keys.ENTER)
+        deadline = time.monotonic() + LOGIN_FORM_WAIT
 
-    # Wait for login to complete
-    time.sleep(8)
-    logger.info("Login completed.")
+        while time.monotonic() < deadline:
+            if _login_completed(driver):
+                logger.info("✓ Existing Naukri session is already authenticated.")
+                return True
 
+            if _manual_verification_required(driver):
+                return _wait_for_login_completion(driver)
+
+            username = _find_visible(driver, _login_username_selectors())
+            password = _find_visible(driver, _login_password_selectors())
+
+            if username and password:
+                try:
+                    username.clear()
+                    username.send_keys(NAUKRI_EMAIL)
+                    password.clear()
+                    password.send_keys(NAUKRI_PASSWORD)
+                    if _click_login_submit(driver, password):
+                        logger.info("Login form submitted; waiting for authentication result.")
+                        break
+                except Exception as exc:
+                    logger.warning(f"Could not fill login form: {exc}")
+                    break
+
+            time.sleep(1)
+
+        if _wait_for_login_completion(driver):
+            return True
+
+    logger.info("Automatic login detection did not complete.")
+    logger.info("👉 Finish login manually in the open browser window.")
+    return _wait_for_login_completion(driver)
 
 def build_search_urls():
     """
