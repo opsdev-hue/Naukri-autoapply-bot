@@ -240,19 +240,20 @@ def _wait_for_login_completion(driver):
         logger.info("LOGIN_WAIT_TIMEOUT=0: waiting indefinitely.")
 
     while timeout == 0 or (time.monotonic() - start) < timeout:
-        if _login_completed(driver):
+        # Check verification first so a security/OTP page is never mistaken for a completed login.
+        if _manual_verification_required(driver):
+            if not challenge_reported:
+                logger.info("🔐 OTP/CAPTCHA/security verification detected.")
+                logger.info("👉 Complete it manually in the open browser window.")
+                logger.info("⏳ The bot will continue automatically after successful login.")
+                challenge_reported = True
+        elif _login_completed(driver):
             logger.info("✓ Naukri login verified.")
             return True
 
         if _login_error_text(driver):
             logger.error("Naukri reported invalid/failed login credentials.")
             return False
-
-        if _manual_verification_required(driver) and not challenge_reported:
-            logger.info("🔐 OTP/CAPTCHA/security verification detected.")
-            logger.info("👉 Complete it manually in the open browser window.")
-            logger.info("⏳ The bot will continue automatically after successful login.")
-            challenge_reported = True
 
         time.sleep(LOGIN_POLL_SECONDS)
 
